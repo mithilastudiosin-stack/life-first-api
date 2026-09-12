@@ -1,0 +1,17 @@
+# --- Core API & Web UI ---
+fastapi
+uvicorn
+gradio
+httpx
+requests
+
+# --- Data Processing & Database ---
+duckdb
+pyarrow
+psutil
+
+# --- Telegram Bot & Hugging Face ---
+pyrogram
+tgcrypto
+huggingface_hub
+flask
