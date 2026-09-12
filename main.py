@@ -10,38 +10,67 @@ import stat
 import tempfile
 import socket
 import urllib.request
-import multiprocessing
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Any
-import psutil
 import duckdb
 import gradio as gr
 import httpx
 import requests
 from fastapi import FastAPI, HTTPException, Query, Response
 
-# ── Cloud Environment Detection ─────────────────────────────────────────────
+# ── Cloud Environment & Real Hardware Detection ───────────────────────────────
 IS_RENDER = os.environ.get("RENDER") == "true"
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
 
-# ── Config & Cloud-Safe Hardware Profiling ──────────────────────────────────
+def get_container_ram_mb():
+    """Accurately detects Docker/Render container RAM limits to prevent 502 OOM crashes."""
+    try:
+        # Check Docker cgroup v2 limits
+        if os.path.exists('/sys/fs/cgroup/memory.max'):
+            with open('/sys/fs/cgroup/memory.max') as f:
+                val = f.read().strip()
+                if val.isdigit():
+                    return int(val) // (1024 * 1024)
+        # Check Docker cgroup v1 limits
+        elif os.path.exists('/sys/fs/cgroup/memory/memory.limit_in_bytes'):
+            with open('/sys/fs/cgroup/memory/memory.limit_in_bytes') as f:
+                val = int(f.read().strip())
+                if val < 100 * 1024**3:  # Ignore absurdly high numbers (no limit)
+                    return val // (1024 * 1024)
+    except Exception:
+        pass
+    
+    # Fallback to physical host RAM if not restricted by Docker
+    try:
+        import psutil
+        return int(psutil.virtual_memory().total / (1024 * 1024))
+    except Exception:
+        return 512 # Absolute safety fallback
+
+def get_cpu_cores():
+    """Accurately detects available CPU cores inside restricted containers."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count() or 2
+
+TOTAL_RAM_MB = get_container_ram_mb()
+SYS_CORES = get_cpu_cores()
+
+# Enforce a hard cap if Render Free Tier fails to report container limits properly
+if IS_RENDER and TOTAL_RAM_MB > 4096:
+    TOTAL_RAM_MB = 512
+
+# Reserve 70% of accurate RAM specifically for DuckDB (leaves 30% for FastAPI/Gradio)
+DUCKDB_RAM_MB = max(128, int(TOTAL_RAM_MB * 0.70))
+PARALLELISM = int(os.environ.get("ICMR_PARALLEL", max(2, SYS_CORES)))
+
+# ── Config ──────────────────────────────────────────────────────────────────
 BASE = os.path.dirname(os.path.abspath(__file__))
 REPO_ID = "aditya7543/Hitek_ImCR_API"
 PORT = int(os.environ.get("PORT", "7860"))
-
-# ⚡ FIXED: Cloud-Safe Hardware Locks
-if IS_RENDER:
-    # Render limits containers to 512MB. psutil will falsely report host RAM.
-    PARALLELISM = 2
-    DUCKDB_RAM_MB = 250
-else:
-    SYS_CORES = multiprocessing.cpu_count()
-    PARALLELISM = int(os.environ.get("ICMR_PARALLEL", max(2, SYS_CORES * 2)))
-    total_ram_mb = int(psutil.virtual_memory().total / (1024**2))
-    DUCKDB_RAM_MB = max(256, int(total_ram_mb * 0.75))
-
 DUPLICATE_CAP = 2
 
 SEARCH_FIELDS = [
@@ -118,18 +147,17 @@ for filename in AVAILABLE_FILES:
 
 print(f"✅ Discovered {sum(len(v) for v in PHONE_MAP.values())} Phone shards and {sum(len(v) for v in AADHAR_MAP.values())} Aadhaar shards.")
 
-# ── 4. Global Shared DuckDB Engine (Strict RAM Allocation) ──────────────────
+# ── 4. Global Shared DuckDB Engine ──────────────────────────────────────────
 global_db = duckdb.connect(":memory:")
 pool = ThreadPoolExecutor(max_workers=PARALLELISM, thread_name_prefix="duck_worker")
 
 def init_global_db():
-    print(f"⚙️ Initializing Global DuckDB Engine (Hardware Lock: {PARALLELISM} Cores / {DUCKDB_RAM_MB}MB RAM)...")
+    print(f"⚙️ DuckDB Dynamic Setup: Detected {TOTAL_RAM_MB}MB System RAM. Allocating {DUCKDB_RAM_MB}MB & {PARALLELISM} Threads.")
     
     global_db.execute(f"SET home_directory='{SAFE_TEMP}'")
     global_db.execute("INSTALL parquet; LOAD parquet;")
     global_db.execute("INSTALL httpfs; LOAD httpfs;")
     
-    global_db.execute("SET enable_object_cache=true;")
     global_db.execute("SET enable_http_metadata_cache=true;")
     global_db.execute("SET http_keep_alive=true;")
     global_db.execute("SET http_retries=5;")
@@ -263,7 +291,7 @@ def _unified_search(q: str, limit: int = 10) -> dict:
     else:
         return {"query": q, "searched_fields": [], "count": 0, "results": [], "from_cache": False}
 
-# ── 7. Cloudflare Tunnel Auto-Manager (Local Only) ──────────────────────────
+# ── 7. Cloudflare Tunnel Auto-Manager ───────────────────────────────────────
 CLOUDFLARE_URL = None
 
 def setup_and_run_cloudflared(port: int):
@@ -303,19 +331,18 @@ async def warmup_cache():
         print("\n🚀 WARMING UP RAM CACHE (OOM-Safe Mode)...")
         loop = asyncio.get_running_loop()
         
-        # ⚡ FIXED: Pauses for 0.2s between queries to let Garbage Collector clear RAM safely
         for prefix in PHONE_PREFIXES:
             if PHONE_MAP.get(prefix):
                 try: 
                     await loop.run_in_executor(pool, lambda p=prefix: global_db.execute(f"SELECT phoneNumber FROM phone_prefix_{p} LIMIT 1").fetchall())
-                    await asyncio.sleep(0.2) 
+                    await asyncio.sleep(0.5) # Increased delay to clear RAM between boots
                 except: pass
                 
         for prefix in AADHAR_PREFIXES:
             if AADHAR_MAP.get(prefix):
                 try: 
                     await loop.run_in_executor(pool, lambda p=prefix: global_db.execute(f"SELECT aadharNumber FROM aadhar_prefix_{p} LIMIT 1").fetchall())
-                    await asyncio.sleep(0.2) 
+                    await asyncio.sleep(0.5) 
                 except: pass
                 
         print("✅ WARMUP SUCCESSFUL: Matrix Footers securely cached in RAM.\n")
@@ -431,7 +458,7 @@ if __name__ == "__main__":
         
     print("\n" + "="*80)
     if IS_RENDER and RENDER_URL:
-        print("🚀 RENDER CLOUD HOSTING DETECTED (OOM-Safe Mode Active)")
+        print("🚀 RENDER CLOUD HOSTING DETECTED (Strict OOM-Safe Mode Active)")
         print(f"🌍 1. Public Web UI   : https://{RENDER_URL}/")
         print(f"🤖 2. Public API      : https://{RENDER_URL}/search?q=6203913021")
     else:
