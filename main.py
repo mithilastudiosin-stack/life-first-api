@@ -19,7 +19,7 @@ import psutil
 import duckdb
 import gradio as gr
 import httpx
-from huggingface_hub import HfApi
+import requests
 from fastapi import FastAPI, HTTPException, Query, Response
 
 # ── Config & Dynamic Hardware Profiling ─────────────────────────────────────
@@ -27,7 +27,6 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 REPO_ID = "aditya7543/Hitek_ImCR_API"
 PORT = int(os.environ.get("PORT", "7860"))
 
-# Dynamic Threads & Caps
 SYS_CORES = multiprocessing.cpu_count()
 PARALLELISM = int(os.environ.get("ICMR_PARALLEL", max(2, SYS_CORES * 2)))
 DUPLICATE_CAP = 2
@@ -42,11 +41,10 @@ TEMP_DIR = os.path.join(tempfile.gettempdir(), "duckdb_cache")
 os.makedirs(TEMP_DIR, exist_ok=True)
 SAFE_TEMP = TEMP_DIR.replace("\\", "/")
 
-# ── 1. PUBLIC REPO URLS (TOKEN REMOVED FOR PUBLIC ACCESS) ───────────────────
-# ⚡ FIXED: Removed the __token__ injection. Hugging Face will now serve this natively since the repo is public.
+# ── 1. PURE PUBLIC REPO URLS (NO TOKENS) ────────────────────────────────────
 HF_INDEX_BASE = f"https://huggingface.co/datasets/{REPO_ID}/resolve/main/production_indexes"
 
-# ── 2. L1 In-Memory LRU Cache ───────────────────────────────────────────────
+# ── 2. L1 In-Memory LRU Cache (No Cache on Fail) ────────────────────────────
 class FastMemoryCache:
     def __init__(self, maxsize: int = 10000, ttl_seconds: int = 7200):
         self.cache: collections.OrderedDict[str, tuple[float, Any]] = collections.OrderedDict()
@@ -72,15 +70,17 @@ class FastMemoryCache:
 
 MEM_CACHE = FastMemoryCache()
 
-# ── 3. Dynamic Index Discovery (Tokenless) ──────────────────────────────────
+# ── 3. Anonymous Public Index Discovery ─────────────────────────────────────
 print("🔍 Discovering production shards in /production_indexes on Hugging Face...")
 try:
-    # ⚡ FIXED: Booting HfApi WITHOUT a token so it behaves as an anonymous public user
-    hf_api = HfApi()
-    repo_files = hf_api.list_repo_tree(repo_id=REPO_ID, path_in_repo="production_indexes", repo_type="dataset")
-    AVAILABLE_FILES = [item.path.split('/')[-1] for item in repo_files if item.path.endswith('.parquet')]
+    # ⚡ FIXED: 100% Anonymous GET request. Bypasses expired environment tokens.
+    tree_url = f"https://huggingface.co/api/datasets/{REPO_ID}/tree/main/production_indexes"
+    resp = requests.get(tree_url, timeout=15)
+    resp.raise_for_status()
+    tree = resp.json()
+    AVAILABLE_FILES = [item['path'].split('/')[-1] for item in tree if item['path'].endswith('.parquet')]
 except Exception as e:
-    print(f"⚠️ Warning: Could not fetch index tree from HF: {e}")
+    print(f"⚠️ Warning: Could not fetch index tree from HF (Public Anonymous Mode): {e}")
     AVAILABLE_FILES = []
 
 PHONE_PREFIXES = ["6", "7", "8", "9", "other"]
@@ -189,15 +189,15 @@ def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
         return cached
 
     if mode != "exact" or not v:
-        return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
+        return {"field": field, "value": value, "mode": mode, "count": 0, "results": [], "from_cache": False}
 
     if field == "phoneNumber":
         prefix = v[0] if v[0] in PHONE_PREFIXES else "other"
-        if not PHONE_MAP.get(prefix): return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
+        if not PHONE_MAP.get(prefix): return {"field": field, "value": value, "mode": mode, "count": 0, "results": [], "from_cache": False}
         view = f"phone_prefix_{prefix}"
     elif field == "aadharNumber":
         prefix = v[0] if v[0] in AADHAR_PREFIXES else None
-        if not prefix or not AADHAR_MAP.get(prefix): return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
+        if not prefix or not AADHAR_MAP.get(prefix): return {"field": field, "value": value, "mode": mode, "count": 0, "results": [], "from_cache": False}
         view = f"aadhar_prefix_{prefix}"
     else:
         view = "people_all"
@@ -211,13 +211,14 @@ def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
         results = _cap_duplicates([dict(zip(cols, r)) for r in rows])[:limit]
         res = {"field": field, "value": value, "mode": mode, "count": len(results), "results": results, "from_cache": False}
         
+        # ⚡ FIXED: Cache is STRICTLY skipped if results are 0
         if len(results) > 0:
             MEM_CACHE.set(cache_key, res)
             
         return res
     except Exception as e:
         print(f"❌ DuckDB Query Error: {e}")
-        return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
+        return {"field": field, "value": value, "mode": mode, "count": 0, "results": [], "from_cache": False}
     finally:
         cursor.close()
 
@@ -247,6 +248,7 @@ def _unified_search(q: str, limit: int = 10) -> dict:
         all_rows = _cap_duplicates(all_rows)[:limit]
         res = {"query": q, "searched_fields": searched, "count": len(all_rows), "results": all_rows, "from_cache": False}
         
+        # ⚡ FIXED: Cache is STRICTLY skipped if results are 0
         if len(all_rows) > 0:
             MEM_CACHE.set(cache_key, res)
             
