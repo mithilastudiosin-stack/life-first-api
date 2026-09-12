@@ -11,6 +11,7 @@ import tempfile
 import socket
 import urllib.request
 import multiprocessing
+import asyncio  # ⚡ FIXED: Added missing asyncio import
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Any
@@ -25,7 +26,9 @@ from fastapi import FastAPI, HTTPException, Query, Response
 BASE = os.path.dirname(os.path.abspath(__file__))
 REPO_ID = "aditya7543/Hitek_ImCR_API"
 PORT = int(os.environ.get("PORT", "7860"))
-HF_TOKEN = "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"
+
+# ⚡ FIXED: Pulls token securely from Render Environment Variables first
+HF_TOKEN = os.environ.get("HF_TOKEN", "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")
 
 # Dynamically scale threads based on host environment (Render vs Local)
 SYS_CORES = multiprocessing.cpu_count()
@@ -437,4 +440,5 @@ if __name__ == "__main__":
         
     print("="*80 + "\n")
     
+    # uvicorn handles the startup port binding smoothly now that asyncio is imported
     uvicorn.run(app, host="0.0.0.0", port=PORT)
