@@ -11,7 +11,7 @@ import tempfile
 import socket
 import urllib.request
 import multiprocessing
-import asyncio  # ⚡ FIXED: Added missing asyncio import
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Any
@@ -19,7 +19,7 @@ import psutil
 import duckdb
 import gradio as gr
 import httpx
-import requests
+from huggingface_hub import HfApi
 from fastapi import FastAPI, HTTPException, Query, Response
 
 # ── Config & Dynamic Hardware Profiling ─────────────────────────────────────
@@ -27,10 +27,9 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 REPO_ID = "aditya7543/Hitek_ImCR_API"
 PORT = int(os.environ.get("PORT", "7860"))
 
-# ⚡ FIXED: Pulls token securely from Render Environment Variables first
-HF_TOKEN = os.environ.get("HF_TOKEN", "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")
+# ⚡ FIXED: Sanitizes token to prevent Linux/VPS 401 Unauthorized newline errors
+HF_TOKEN = os.environ.get("HF_TOKEN", "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").strip()
 
-# Dynamically scale threads based on host environment (Render vs Local)
 SYS_CORES = multiprocessing.cpu_count()
 PARALLELISM = int(os.environ.get("ICMR_PARALLEL", max(2, SYS_CORES * 2)))
 DUPLICATE_CAP = 2
@@ -77,17 +76,14 @@ MEM_CACHE = FastMemoryCache()
 # ── 3. Dynamic Index Discovery (Dual Matrix) ────────────────────────────────
 print("🔍 Discovering production shards in /production_indexes on Hugging Face...")
 try:
-    tree_url = f"https://huggingface.co/api/datasets/{REPO_ID}/tree/main/production_indexes"
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-    resp = requests.get(tree_url, headers=headers, timeout=10)
-    resp.raise_for_status()
-    tree = resp.json()
-    AVAILABLE_FILES = [item['path'].split('/')[-1] for item in tree if item['path'].endswith('.parquet')]
+    # ⚡ FIXED: Uses robust HfApi instead of raw requests to bypass VPS Auth errors
+    hf_api = HfApi(token=HF_TOKEN)
+    repo_files = hf_api.list_repo_tree(repo_id=REPO_ID, path_in_repo="production_indexes", repo_type="dataset")
+    AVAILABLE_FILES = [item.path.split('/')[-1] for item in repo_files if item.path.endswith('.parquet')]
 except Exception as e:
     print(f"⚠️ Warning: Could not fetch index tree from HF: {e}")
     AVAILABLE_FILES = []
 
-# DUAL ROUTING MATRICES
 PHONE_PREFIXES = ["6", "7", "8", "9", "other"]
 AADHAR_PREFIXES = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
 
@@ -118,7 +114,6 @@ pool = ThreadPoolExecutor(max_workers=PARALLELISM, thread_name_prefix="duck_work
 def init_global_db():
     print("⚙️ Initializing Global DuckDB Engine with Dual Matrix Routing...")
     
-    # Render Safe RAM Allocation (75% of exact available memory)
     total_ram_mb = int(psutil.virtual_memory().total / (1024**2))
     duckdb_ram_mb = max(256, int(total_ram_mb * 0.75))
     
@@ -196,8 +191,7 @@ def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
 
     if mode != "exact" or not v:
         res = {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
-        MEM_CACHE.set(cache_key, res)
-        return res
+        return res # ⚡ FIXED: Does not cache empty fails
 
     if field == "phoneNumber":
         prefix = v[0] if v[0] in PHONE_PREFIXES else "other"
@@ -218,7 +212,11 @@ def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
         cols = [d[0] for d in cursor.description]
         results = _cap_duplicates([dict(zip(cols, r)) for r in rows])[:limit]
         res = {"field": field, "value": value, "mode": mode, "count": len(results), "results": results, "from_cache": False}
-        MEM_CACHE.set(cache_key, res)
+        
+        # ⚡ FIXED: Only writes to memory cache if it successfully found data
+        if len(results) > 0:
+            MEM_CACHE.set(cache_key, res)
+            
         return res
     except Exception as e:
         print(f"❌ DuckDB Query Error: {e}")
@@ -229,6 +227,7 @@ def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
 def _unified_search(q: str, limit: int = 10) -> dict:
     q = q.strip()
     cache_key = f"unified:{q}:{limit}"
+    
     cached = MEM_CACHE.get(cache_key)
     if cached is not None:
         cached["from_cache"] = True
@@ -250,12 +249,14 @@ def _unified_search(q: str, limit: int = 10) -> dict:
                 
         all_rows = _cap_duplicates(all_rows)[:limit]
         res = {"query": q, "searched_fields": searched, "count": len(all_rows), "results": all_rows, "from_cache": False}
-        MEM_CACHE.set(cache_key, res)
+        
+        # ⚡ FIXED: Only cache successful unified searches
+        if len(all_rows) > 0:
+            MEM_CACHE.set(cache_key, res)
+            
         return res
     else:
-        res = {"query": q, "searched_fields": [], "count": 0, "results": [], "from_cache": False}
-        MEM_CACHE.set(cache_key, res)
-        return res
+        return {"query": q, "searched_fields": [], "count": 0, "results": [], "from_cache": False}
 
 # ── 7. Cloudflare Tunnel Auto-Manager ───────────────────────────────────────
 CLOUDFLARE_URL = None
@@ -408,11 +409,9 @@ app = gr.mount_gradio_app(fastapi_app, demo, path="/")
 if __name__ == "__main__":
     import uvicorn
     
-    # Check if running on Render.com
     IS_RENDER = os.environ.get("RENDER") == "true"
     RENDER_URL = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
     
-    # Only boot Cloudflare if running Locally (Saves RAM/CPU on Render)
     if not IS_RENDER:
         threading.Thread(target=setup_and_run_cloudflared, args=(PORT,), daemon=True).start()
     
@@ -435,10 +434,9 @@ if __name__ == "__main__":
         print("-" * 80)
         print(f"📱 3. Network UI     : http://{local_lan_ip}:{PORT}/  <-- (Test on your phone via WiFi)")
         
-        time.sleep(3) # Wait for Cloudflare
+        time.sleep(3) 
         if CLOUDFLARE_URL: print(f"☁️ 4. Cloudflare URL : {CLOUDFLARE_URL}/")
         
     print("="*80 + "\n")
     
-    # uvicorn handles the startup port binding smoothly now that asyncio is imported
     uvicorn.run(app, host="0.0.0.0", port=PORT)
