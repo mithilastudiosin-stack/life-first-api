@@ -27,9 +27,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 REPO_ID = "aditya7543/Hitek_ImCR_API"
 PORT = int(os.environ.get("PORT", "7860"))
 
-# ⚡ FIXED: Sanitizes token to prevent Linux/VPS 401 Unauthorized newline errors
-HF_TOKEN = os.environ.get("HF_TOKEN", "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").strip()
-
+# Dynamic Threads & Caps
 SYS_CORES = multiprocessing.cpu_count()
 PARALLELISM = int(os.environ.get("ICMR_PARALLEL", max(2, SYS_CORES * 2)))
 DUPLICATE_CAP = 2
@@ -44,8 +42,9 @@ TEMP_DIR = os.path.join(tempfile.gettempdir(), "duckdb_cache")
 os.makedirs(TEMP_DIR, exist_ok=True)
 SAFE_TEMP = TEMP_DIR.replace("\\", "/")
 
-# ── 1. BULLETPROOF AUTHENTICATED URLS ───────────────────────────────────────
-HF_INDEX_BASE = f"https://__token__:{HF_TOKEN}@huggingface.co/datasets/{REPO_ID}/resolve/main/production_indexes"
+# ── 1. PUBLIC REPO URLS (TOKEN REMOVED FOR PUBLIC ACCESS) ───────────────────
+# ⚡ FIXED: Removed the __token__ injection. Hugging Face will now serve this natively since the repo is public.
+HF_INDEX_BASE = f"https://huggingface.co/datasets/{REPO_ID}/resolve/main/production_indexes"
 
 # ── 2. L1 In-Memory LRU Cache ───────────────────────────────────────────────
 class FastMemoryCache:
@@ -73,11 +72,11 @@ class FastMemoryCache:
 
 MEM_CACHE = FastMemoryCache()
 
-# ── 3. Dynamic Index Discovery (Dual Matrix) ────────────────────────────────
+# ── 3. Dynamic Index Discovery (Tokenless) ──────────────────────────────────
 print("🔍 Discovering production shards in /production_indexes on Hugging Face...")
 try:
-    # ⚡ FIXED: Uses robust HfApi instead of raw requests to bypass VPS Auth errors
-    hf_api = HfApi(token=HF_TOKEN)
+    # ⚡ FIXED: Booting HfApi WITHOUT a token so it behaves as an anonymous public user
+    hf_api = HfApi()
     repo_files = hf_api.list_repo_tree(repo_id=REPO_ID, path_in_repo="production_indexes", repo_type="dataset")
     AVAILABLE_FILES = [item.path.split('/')[-1] for item in repo_files if item.path.endswith('.parquet')]
 except Exception as e:
@@ -190,8 +189,7 @@ def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
         return cached
 
     if mode != "exact" or not v:
-        res = {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
-        return res # ⚡ FIXED: Does not cache empty fails
+        return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
 
     if field == "phoneNumber":
         prefix = v[0] if v[0] in PHONE_PREFIXES else "other"
@@ -213,7 +211,6 @@ def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
         results = _cap_duplicates([dict(zip(cols, r)) for r in rows])[:limit]
         res = {"field": field, "value": value, "mode": mode, "count": len(results), "results": results, "from_cache": False}
         
-        # ⚡ FIXED: Only writes to memory cache if it successfully found data
         if len(results) > 0:
             MEM_CACHE.set(cache_key, res)
             
@@ -250,7 +247,6 @@ def _unified_search(q: str, limit: int = 10) -> dict:
         all_rows = _cap_duplicates(all_rows)[:limit]
         res = {"query": q, "searched_fields": searched, "count": len(all_rows), "results": all_rows, "from_cache": False}
         
-        # ⚡ FIXED: Only cache successful unified searches
         if len(all_rows) > 0:
             MEM_CACHE.set(cache_key, res)
             
