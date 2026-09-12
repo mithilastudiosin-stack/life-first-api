@@ -22,13 +22,26 @@ import httpx
 import requests
 from fastapi import FastAPI, HTTPException, Query, Response
 
-# ── Config & Dynamic Hardware Profiling ─────────────────────────────────────
+# ── Cloud Environment Detection ─────────────────────────────────────────────
+IS_RENDER = os.environ.get("RENDER") == "true"
+RENDER_URL = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+
+# ── Config & Cloud-Safe Hardware Profiling ──────────────────────────────────
 BASE = os.path.dirname(os.path.abspath(__file__))
 REPO_ID = "aditya7543/Hitek_ImCR_API"
 PORT = int(os.environ.get("PORT", "7860"))
 
-SYS_CORES = multiprocessing.cpu_count()
-PARALLELISM = int(os.environ.get("ICMR_PARALLEL", max(2, SYS_CORES * 2)))
+# ⚡ FIXED: Cloud-Safe Hardware Locks
+if IS_RENDER:
+    # Render limits containers to 512MB. psutil will falsely report host RAM.
+    PARALLELISM = 2
+    DUCKDB_RAM_MB = 250
+else:
+    SYS_CORES = multiprocessing.cpu_count()
+    PARALLELISM = int(os.environ.get("ICMR_PARALLEL", max(2, SYS_CORES * 2)))
+    total_ram_mb = int(psutil.virtual_memory().total / (1024**2))
+    DUCKDB_RAM_MB = max(256, int(total_ram_mb * 0.75))
+
 DUPLICATE_CAP = 2
 
 SEARCH_FIELDS = [
@@ -73,7 +86,6 @@ MEM_CACHE = FastMemoryCache()
 # ── 3. Anonymous Public Index Discovery ─────────────────────────────────────
 print("🔍 Discovering production shards in /production_indexes on Hugging Face...")
 try:
-    # ⚡ FIXED: 100% Anonymous GET request. Bypasses expired environment tokens.
     tree_url = f"https://huggingface.co/api/datasets/{REPO_ID}/tree/main/production_indexes"
     resp = requests.get(tree_url, timeout=15)
     resp.raise_for_status()
@@ -106,15 +118,12 @@ for filename in AVAILABLE_FILES:
 
 print(f"✅ Discovered {sum(len(v) for v in PHONE_MAP.values())} Phone shards and {sum(len(v) for v in AADHAR_MAP.values())} Aadhaar shards.")
 
-# ── 4. Global Shared DuckDB Engine (Dynamic RAM Allocation) ─────────────────
+# ── 4. Global Shared DuckDB Engine (Strict RAM Allocation) ──────────────────
 global_db = duckdb.connect(":memory:")
 pool = ThreadPoolExecutor(max_workers=PARALLELISM, thread_name_prefix="duck_worker")
 
 def init_global_db():
-    print("⚙️ Initializing Global DuckDB Engine with Dual Matrix Routing...")
-    
-    total_ram_mb = int(psutil.virtual_memory().total / (1024**2))
-    duckdb_ram_mb = max(256, int(total_ram_mb * 0.75))
+    print(f"⚙️ Initializing Global DuckDB Engine (Hardware Lock: {PARALLELISM} Cores / {DUCKDB_RAM_MB}MB RAM)...")
     
     global_db.execute(f"SET home_directory='{SAFE_TEMP}'")
     global_db.execute("INSTALL parquet; LOAD parquet;")
@@ -126,7 +135,7 @@ def init_global_db():
     global_db.execute("SET http_retries=5;")
     global_db.execute("SET http_retry_wait_ms=1000;")
     global_db.execute("SET http_timeout=60000;")
-    global_db.execute(f"SET memory_limit='{duckdb_ram_mb}MB';")
+    global_db.execute(f"SET memory_limit='{DUCKDB_RAM_MB}MB';")
     global_db.execute("SET preserve_insertion_order=false;")
     global_db.execute(f"SET threads={PARALLELISM};")
 
@@ -211,7 +220,6 @@ def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
         results = _cap_duplicates([dict(zip(cols, r)) for r in rows])[:limit]
         res = {"field": field, "value": value, "mode": mode, "count": len(results), "results": results, "from_cache": False}
         
-        # ⚡ FIXED: Cache is STRICTLY skipped if results are 0
         if len(results) > 0:
             MEM_CACHE.set(cache_key, res)
             
@@ -248,7 +256,6 @@ def _unified_search(q: str, limit: int = 10) -> dict:
         all_rows = _cap_duplicates(all_rows)[:limit]
         res = {"query": q, "searched_fields": searched, "count": len(all_rows), "results": all_rows, "from_cache": False}
         
-        # ⚡ FIXED: Cache is STRICTLY skipped if results are 0
         if len(all_rows) > 0:
             MEM_CACHE.set(cache_key, res)
             
@@ -256,7 +263,7 @@ def _unified_search(q: str, limit: int = 10) -> dict:
     else:
         return {"query": q, "searched_fields": [], "count": 0, "results": [], "from_cache": False}
 
-# ── 7. Cloudflare Tunnel Auto-Manager ───────────────────────────────────────
+# ── 7. Cloudflare Tunnel Auto-Manager (Local Only) ──────────────────────────
 CLOUDFLARE_URL = None
 
 def setup_and_run_cloudflared(port: int):
@@ -293,22 +300,27 @@ async def pinger():
 async def warmup_cache():
     if not ALL_URLS: return
     try:
+        print("\n🚀 WARMING UP RAM CACHE (OOM-Safe Mode)...")
         loop = asyncio.get_running_loop()
-        def _warmup_query():
-            cursor = global_db.cursor()
-            for prefix in PHONE_PREFIXES:
-                if PHONE_MAP.get(prefix):
-                    try: cursor.execute(f"SELECT phoneNumber FROM phone_prefix_{prefix} LIMIT 1").fetchall()
-                    except: pass
-            for prefix in AADHAR_PREFIXES:
-                if AADHAR_MAP.get(prefix):
-                    try: cursor.execute(f"SELECT aadharNumber FROM aadhar_prefix_{prefix} LIMIT 1").fetchall()
-                    except: pass
-            cursor.close()
-            
-        await loop.run_in_executor(pool, _warmup_query)
-        print("\n🚀 WARMUP SUCCESSFUL: Matrix Footers securely cached in RAM.\n")
-    except Exception as e: pass
+        
+        # ⚡ FIXED: Pauses for 0.2s between queries to let Garbage Collector clear RAM safely
+        for prefix in PHONE_PREFIXES:
+            if PHONE_MAP.get(prefix):
+                try: 
+                    await loop.run_in_executor(pool, lambda p=prefix: global_db.execute(f"SELECT phoneNumber FROM phone_prefix_{p} LIMIT 1").fetchall())
+                    await asyncio.sleep(0.2) 
+                except: pass
+                
+        for prefix in AADHAR_PREFIXES:
+            if AADHAR_MAP.get(prefix):
+                try: 
+                    await loop.run_in_executor(pool, lambda p=prefix: global_db.execute(f"SELECT aadharNumber FROM aadhar_prefix_{p} LIMIT 1").fetchall())
+                    await asyncio.sleep(0.2) 
+                except: pass
+                
+        print("✅ WARMUP SUCCESSFUL: Matrix Footers securely cached in RAM.\n")
+    except Exception as e: 
+        print(f"⚠️ Warmup interrupted: {e}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -407,9 +419,6 @@ app = gr.mount_gradio_app(fastapi_app, demo, path="/")
 if __name__ == "__main__":
     import uvicorn
     
-    IS_RENDER = os.environ.get("RENDER") == "true"
-    RENDER_URL = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
-    
     if not IS_RENDER:
         threading.Thread(target=setup_and_run_cloudflared, args=(PORT,), daemon=True).start()
     
@@ -422,7 +431,7 @@ if __name__ == "__main__":
         
     print("\n" + "="*80)
     if IS_RENDER and RENDER_URL:
-        print("🚀 RENDER CLOUD HOSTING DETECTED (Ultra-Fast Mode Active)")
+        print("🚀 RENDER CLOUD HOSTING DETECTED (OOM-Safe Mode Active)")
         print(f"🌍 1. Public Web UI   : https://{RENDER_URL}/")
         print(f"🤖 2. Public API      : https://{RENDER_URL}/search?q=6203913021")
     else:
